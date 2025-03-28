@@ -1,0 +1,12 @@
+[package]
+name = "mothra"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "=0.16.0"
+winit = "0.28"
+pollster = "0.3"
+bytemuck = { version = "1.13", features = ["derive"] }
+cgmath = "0.18"  # 行列処理用
+image = "0.24" # 画像読み込み用（PNGなど対応）
