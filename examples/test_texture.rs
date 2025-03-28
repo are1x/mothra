@@ -7,6 +7,7 @@ use winit::{
 use mothra::renderer::Renderer; // ← `lib.rs` 経由で `renderer.rs` にある `Renderer` を呼び出す
 
 fn main() {
+    
     // イベントループとウィンドウ作成
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -16,6 +17,7 @@ fn main() {
 
     // レンダラー初期化（非同期ブロッキング）
     let mut renderer = pollster::block_on(Renderer::new(&window));
+    let tex = renderer.load_texture("assets/textures/black_plane_image.png");
 
     // 今は描画する内容がないので、Renderer::render() が画面クリアだけ行う状態でもOK
 
@@ -35,7 +37,14 @@ fn main() {
             }
 
             Event::RedrawRequested(_) => {
-                renderer.render(); // ← 今後ここに draw_texture() などを追加していく
+                let output = renderer.surface.get_current_texture().unwrap();
+                let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+                renderer.draw_texture(&mut encoder, &view, &tex, 100.0, 100.0, 256.0, 256.0);
+
+                renderer.queue.submit(Some(encoder.finish()));
+                output.present();
             }
 
             Event::WindowEvent {
