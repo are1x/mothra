@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::ecs::World;
+use crate::GameConfig;
 
 /// 描画エンジンの中心構造体。WGPU の初期化、描画処理、リソース管理などを担当する。
 pub struct Renderer {
@@ -226,13 +227,28 @@ impl Renderer {
         }
     }
 
-    // resize 時は uniform は固定のままとするため、ここではサイズ変更のみを行う
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+    /// 指定したスケール値で uniform_buffer を更新します。
+    pub fn update_uniform(&self, scale: &[f32; 2]) {
+        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(scale));
+    }
+
+    /// ウィンドウサイズが変更されたときの処理。
+    /// 新しい物理サイズでサーフェスを再構成し、stretch_mode に応じて uniform_buffer を更新する。
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>, config: &GameConfig) {
         if new_size.width > 0 && new_size.height > 0 {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            // uniform_buffer は固定の論理サイズ（800×600）に基づくため更新しない
+
+            // stretch_mode の値によって、uniform のスケールを決定する
+            let scale = if config.stretch_mode {
+                // ウィンドウの物理サイズに合わせる
+                [2.0 / new_size.width as f32, 2.0 / new_size.height as f32]
+            } else {
+                // 論理解像度を固定（config.logical_width, config.logical_height に基づく）
+                [2.0 / config.logical_width as f32, 2.0 / config.logical_height as f32]
+            };
+            self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&scale));
         }
     }
 
