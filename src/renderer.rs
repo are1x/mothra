@@ -1,7 +1,13 @@
 // src/renderer.rs
 
+use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+use crate::ecs::World;
 
 /// 描画エンジンの中心構造体。WGPU の初期化、描画処理、リソース管理などを担当する。
 pub struct Renderer {
@@ -20,6 +26,9 @@ pub struct Renderer {
     // ユニフォーム用のバッファとバインドグループ
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+
+    // 追加：テクスチャ用 bind group のキャッシュ
+    texture_bind_group_cache: RefCell<HashMap<*const TextureHandle, Rc<wgpu::BindGroup>>>,
 }
 
 pub struct TextureHandle {
@@ -207,8 +216,9 @@ impl Renderer {
             texture_bind_group_layout,
             vertex_buffer,
             index_buffer,
-            uniform_buffer,      // 固定の uniform_buffer
-            uniform_bind_group,  // 固定の uniform_bind_group
+            uniform_buffer,
+            uniform_bind_group,
+            texture_bind_group_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -384,4 +394,85 @@ impl Renderer {
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..6, 0, 0..1);
     }
+
+    /// World 内のエンティティをすべて描画する。
+    /// ここでは、各エンティティごとに新しい bind group を作成し、ローカルなベクターに保持してから描画します。
+    pub fn draw_world(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        world: &crate::ecs::World,
+    ) {
+        // 各エンティティごとのリソースを保持するベクターを用意する
+        let mut entity_vertex_buffers: Vec<wgpu::Buffer> = Vec::new();
+        let mut entity_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+        let mut transforms: Vec<crate::ecs::Transform> = Vec::new();
+    
+        // すべての描画対象エンティティについて、各リソースを生成して保持する
+        for (transform, texture) in world.query_drawables() {
+            transforms.push(transform);
+            // 論理座標系 (0,0)-(800,600) を前提とする頂点データ
+            let vertex_data = [
+                [transform.x, transform.y + transform.h, 0.0, 0.0],     // 左上
+                [transform.x + transform.w, transform.y + transform.h, 1.0, 0.0], // 右上
+                [transform.x + transform.w, transform.y, 1.0, 1.0],       // 右下
+                [transform.x, transform.y, 0.0, 1.0],                     // 左下
+            ];
+            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Entity Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertex_data),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            entity_vertex_buffers.push(vb);
+    
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                    },
+                ],
+                label: Some("Entity Texture BindGroup"),
+            });
+            entity_bind_groups.push(bg);
+        }
+    
+        // レンダーパスを一度だけ開始する
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("World Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+    
+            pass.set_pipeline(&self.texture_pipeline);
+            // ユニフォームは共通
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+    
+            // 各エンティティごとに描画コマンドを記録する
+            for (i, _transform) in transforms.iter().enumerate() {
+                pass.set_bind_group(1, &entity_bind_groups[i], &[]);
+                pass.set_vertex_buffer(0, entity_vertex_buffers[i].slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..6, 0, 0..1);
+            }
+        }
+        // レンダーパス終了後、上記ベクターに保持していたリソースは drop されますが、
+        // コマンドバッファには既に記録されているので問題ありません。
+    }
+    
+    
+
 }
