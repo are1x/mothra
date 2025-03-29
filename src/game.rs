@@ -1,86 +1,79 @@
+use crate::ecs::World;
+use crate::input::InputState;
+use crate::renderer::Renderer;
+use crate::config::GameConfig;
+use winit::{
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+use pollster::block_on;
+use std::time::{Duration, Instant};
 
-use crate::World;
-use crate::Renderer;
-use crate::InputState;
 /// ゲームのメインロジックを定義するトレイト。
-
 pub trait Game {
-    /// 毎フレームの更新処理。World やレンダラー、入力状態を受け取り、ゲーム状態を更新する。
+    /// 毎フレームの更新処理。
     fn update(&mut self, world: &mut World, renderer: &mut Renderer, input: &InputState);
-
-    /// 毎フレームの描画処理。更新済みの状態を元にレンダリングを行う。
-    fn render(&mut self, world: &World, renderer: &mut Renderer);
+    /// 毎フレームの描画処理。`view` と `encoder` を使って描画コマンドを記録する。
+    fn render(&mut self, world: &World, renderer: &mut Renderer, view: &wgpu::TextureView, encoder: &mut wgpu::CommandEncoder);
 }
 
-/// ゲームエンジンを起動するエントリーポイント関数。
+/// run_game 関数
 ///
-/// 利用者はこの関数に自分のゲームロジックを実装した型を渡すだけで、
-/// ウィンドウ生成、レンダラー、ECSのWorld、入力処理などが内部で初期化され、
-/// イベントループが自動で実行されます。
-///
-/// # 引数
-/// * `game` - ゲームロジックを実装したオブジェクト（Gameトレイトの実装）
-///
-/// # 例
-/// ```rust
-/// struct MyGame { /* 独自の状態 */ }
-///
-/// impl Game for MyGame {
-///     fn update(&mut self, world: &mut World, renderer: &mut Renderer, input: &InputState) {
-///         // ゲームの更新処理
-///     }
-///
-///     fn render(&mut self, world: &World, renderer: &mut Renderer) {
-///         // 描画処理
-///     }
-/// }
-///
-/// fn main() {
-///     mothra::run_game(MyGame { /* 初期状態 */ });
-/// }
-/// ```
-pub fn run_game<G: 'static + Game>(mut game: G) -> ! {
-    use winit::{
-        event::{Event, WindowEvent},
-        event_loop::{ControlFlow, EventLoop},
-        window::WindowBuilder,
-    };
-
-    // ウィンドウ作成
+/// この関数は、Gameトレイトを実装したゲームロジックと設定情報(GameConfig)を受け取り、
+/// 内部でウィンドウ生成、Renderer、World、InputState の初期化、FPS制御付きイベントループを管理します。
+pub fn run_game<G: 'static + Game>(mut game: G, config: GameConfig) -> ! {
+    // イベントループとウィンドウの作成
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title("Mothra Engine")
-        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))
+        .with_title(config.title.clone())
+        .with_inner_size(winit::dpi::LogicalSize::new(config.window_width, config.window_height))
         .build(&event_loop)
         .unwrap();
 
-    // Renderer, World, InputState の初期化（各自のモジュールで定義済みと仮定）
-    let mut renderer = pollster::block_on(Renderer::new(&window));
-    let mut world = World::new();
-    let mut input = InputState::default();
+    // Renderer, World, InputState の初期化
+    let mut renderer = block_on(Renderer::new(&window));
+    let mut world = crate::ecs::World::new();
+    let mut input = crate::input::InputState::default();
 
-    // （ここで初期シーン構築や入力リソースの設定も行う）
+    // FPS制御用の目標フレーム時間
+    let target_frame_duration = Duration::from_millis(1000 / config.target_fps as u64);
+    let mut last_frame_time = Instant::now();
 
-    // イベントループ
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
         match event {
             Event::WindowEvent { ref event, .. } => {
-                // 入力状態更新（input.rs 内の実装を利用）
                 input.update(event);
             }
             Event::MainEventsCleared => {
-                // ゲームロジックの更新
-                game.update(&mut world, &mut renderer, &input);
-                window.request_redraw();
+                let now = Instant::now();
+                let elapsed = now - last_frame_time;
+                if elapsed < target_frame_duration {
+                    *control_flow = ControlFlow::WaitUntil(now + target_frame_duration - elapsed);
+                } else {
+                    last_frame_time = now;
+                    game.update(&mut world, &mut renderer, &input);
+                    window.request_redraw();
+                }
             }
             Event::RedrawRequested(_) => {
-                // ゲームロジックの描画
-                game.render(&world, &mut renderer);
+                let output = match renderer.surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        renderer.surface.configure(&renderer.device, &renderer.config);
+                        renderer.surface
+                            .get_current_texture()
+                            .expect("Failed to acquire texture")
+                    }
+                };
+                let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                game.render(&world, &mut renderer, &view, &mut encoder);
+                renderer.queue.submit(Some(encoder.finish()));
+                output.present();
             }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested, ..
-            } => {
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}

@@ -31,10 +31,14 @@ pub struct Renderer {
     texture_bind_group_cache: RefCell<HashMap<*const TextureHandle, Rc<wgpu::BindGroup>>>,
 }
 
+/// テクスチャとサンプラーをまとめた構造体。
+/// テクスチャ本体も保持することで、ビューが無効にならないようにする。
 pub struct TextureHandle {
+    pub texture: wgpu::Texture,  // 追加: テクスチャ本体を保持
     pub view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
 }
+
 
 impl Renderer {
     /// Renderer構造体の初期化。
@@ -278,7 +282,7 @@ impl Renderer {
     /// * `TextureHandle` - view + sampler を含む構造体
     pub fn load_texture(&self, path: &str) -> TextureHandle {
         use image::GenericImageView;
-
+    
         let img = image::open(path).expect("Failed to open image").to_rgba8();
         let (width, height) = img.dimensions();
         let size = wgpu::Extent3d {
@@ -286,7 +290,7 @@ impl Renderer {
             height,
             depth_or_array_layers: 1,
         };
-
+    
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("User Texture"),
             size,
@@ -297,7 +301,7 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-
+    
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
@@ -313,7 +317,7 @@ impl Renderer {
             },
             size,
         );
-
+    
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -322,9 +326,14 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-
-        TextureHandle { view, sampler }
+    
+        TextureHandle {
+            texture, // テクスチャ本体を保持する
+            view,
+            sampler,
+        }
     }
+    
 
     /// 指定したテクスチャを、指定した領域に描画する。
     ///
