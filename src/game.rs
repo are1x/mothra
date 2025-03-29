@@ -43,6 +43,7 @@ pub fn run_game<G: 'static + Game>(mut game: G, config: GameConfig) -> ! {
         } else {
             [2.0 / config.logical_width as f32, 2.0 / config.logical_height as f32]
         };
+        log::debug!(target: "rendering", "Setting uniform scale to: {:?}", scale);
         renderer.update_uniform(&scale);
     }
 

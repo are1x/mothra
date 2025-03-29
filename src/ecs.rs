@@ -7,12 +7,13 @@ use std::rc::Rc;
 pub type Entity = u32;
 
 /// Entityの2D座標とサイズ情報
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Transform {
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    pub z: f32, // 追加: 描画順（低いほど奥）
 }
 
 /// テクスチャを参照する Sprite コンポーネント（共有参照）
@@ -62,5 +63,17 @@ impl World {
                 self.sprites.get(&e).map(|s| (*t, s.texture.as_ref()))
             })
             .collect()
+    }
+
+    /// 描画対象のエンティティを、Transform と Sprite（テクスチャ）のペアとして返す。
+    /// さらに、Transform の z 値でソートして、描画順（奥から手前）を確定する。
+    pub fn query_drawables_with_z(&self) -> Vec<(Transform, Rc<TextureHandle>)> {
+        let mut drawables: Vec<(Transform, Rc<TextureHandle>)> = self.transforms.iter()
+            .filter_map(|(&entity, &transform)| {
+                self.sprites.get(&entity).map(|sprite| (transform, Rc::clone(&sprite.texture)))
+            })
+            .collect();
+        drawables.sort_by(|(t1, _), (t2, _)| t1.z.partial_cmp(&t2.z).unwrap());
+        drawables
     }
 }

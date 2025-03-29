@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use futures::channel::oneshot;
+use std::time::Instant;
+
+use pollster;
+
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -28,12 +33,21 @@ pub struct Renderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
 
-    // 追加：テクスチャ用 bind group のキャッシュ
+    //テクスチャ用 bind group のキャッシュ
     texture_bind_group_cache: RefCell<HashMap<*const TextureHandle, Rc<wgpu::BindGroup>>>,
+
+    //ダブルバッファ用の頂点バッファとインデックスバッファ、バッファ切り替え用のインデックス
+    pub batched_vertex_buffers: [wgpu::Buffer; 2],
+    pub batched_index_buffers: [wgpu::Buffer; 2],
+    pub current_buffer: usize,
+
+    pub batched_vertex_buffer: wgpu::Buffer,
+    pub batched_index_buffer: wgpu::Buffer,
 }
 
 /// テクスチャとサンプラーをまとめた構造体。
 /// テクスチャ本体も保持することで、ビューが無効にならないようにする。
+#[derive(Debug)]
 pub struct TextureHandle {
     pub texture: wgpu::Texture,  // 追加: テクスチャ本体を保持
     pub view: wgpu::TextureView,
@@ -210,6 +224,48 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        // 新たにダブルバッファを初期化（サイズは例として 4096 バイト）
+        let batched_vertex_buffer_0 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batched Vertex Buffer 0"),
+            size: 4096,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let batched_vertex_buffer_1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batched Vertex Buffer 1"),
+            size: 4096,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let batched_index_buffer_0 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batched Index Buffer 0"),
+            size: 4096,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let batched_index_buffer_1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batched Index Buffer 1"),
+            size: 4096,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // AssetManager のキャッシュやその他のフィールドも初期化
+        let texture_bind_group_cache = std::cell::RefCell::new(HashMap::new());
+
+        let batched_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batched Vertex Buffer"),
+            size: 128 * 1024, // 128KB
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let batched_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batched Index Buffer"),
+            size: 32 * 1024, // 32KB
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // 構造体の生成・返却
         Self {
             device,
@@ -223,7 +279,14 @@ impl Renderer {
             index_buffer,
             uniform_buffer,
             uniform_bind_group,
-            texture_bind_group_cache: RefCell::new(HashMap::new()),
+            texture_bind_group_cache,
+
+            batched_vertex_buffers: [batched_vertex_buffer_0, batched_vertex_buffer_1],
+            batched_index_buffers: [batched_index_buffer_0, batched_index_buffer_1],
+            current_buffer: 0,
+
+            batched_vertex_buffer,
+            batched_index_buffer
         }
     }
 
@@ -252,41 +315,36 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, world: &crate::ecs::World) {
+        log::debug!(target: "rendering", "=== Starting render() ===");
         let output = match self.surface.get_current_texture() {
             Ok(tex) => tex,
             Err(_) => {
                 self.surface.configure(&self.device, &self.config);
-                self.surface.get_current_texture().expect("Surface再取得失敗")
+                self.surface.get_current_texture().expect("Failed to reacquire surface texture")
             }
         };
-
+        
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-        {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.1,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            // 他の描画処理（draw_quad, draw_texture など）を呼び出す
-        }
-
+        
+        self.draw_sprites_batched(&mut encoder, &view, world);
+        
         self.queue.submit(Some(encoder.finish()));
         output.present();
+        
+        let sync_start = std::time::Instant::now();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        self.queue.on_submitted_work_done(move || {
+            let _ = sender.send(());
+        });
+        pollster::block_on(receiver).unwrap();
+        let sync_duration = sync_start.elapsed();
+        log::debug!(target: "rendering", "GPU synchronization complete in {:?}", sync_duration);
+        
+        log::debug!(target: "rendering", "Before switching, current_buffer = {}", self.current_buffer);
+        self.current_buffer = (self.current_buffer + 1) % self.batched_vertex_buffers.len();
+        log::debug!(target: "rendering", "Switched current_buffer to {}", self.current_buffer);
     }
 
     /// テクスチャを読み込み、GPUへ転送して TextureHandle を返す。
@@ -466,6 +524,11 @@ impl Renderer {
             });
             entity_bind_groups.push(bg);
         }
+
+        // draw_world 内のループでテクスチャ情報を出力（比較用）
+        for (i, (_transform, texture)) in world.query_drawables().iter().enumerate() {
+            log::debug!(target: "rendering", "draw_world Entity {}: texture_ptr = {:p}", i, texture);
+        }
     
         // レンダーパスを一度だけ開始する
         {
@@ -498,6 +561,173 @@ impl Renderer {
         // コマンドバッファには既に記録されているので問題ありません。
     }
     
+     /// draw_sprites_batched は、World 内のエンティティ（Transform と Rc<TextureHandle> のペア）
+    /// をテクスチャごとにグループ化し、事前確保されたダブルバッファに頂点・インデックスデータを書き込み
+    /// そのオフセット情報をもとに一括描画します。各グループの内部状態を詳細にログ出力します。
+    pub fn draw_sprites_batched(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        world: &crate::ecs::World,
+    ) {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        log::debug!(target: "rendering", "=== Starting draw_sprites_batched ===");
     
+        // (1) Query and sort drawables
+        let mut drawables = world.query_drawables_with_z();
+        drawables.sort_by(|(a, _), (b, _)| a.z.partial_cmp(&b.z).unwrap());
+        log::debug!(target: "rendering", "Sorted drawables by z. Total drawables: {}", drawables.len());
+        for (i, (transform, _)) in drawables.iter().enumerate() {
+            log::debug!(target: "rendering", "Drawable {}: pos=({:.2},{:.2}), size=({:.2},{:.2}), z={:.2}",
+                i, transform.x, transform.y, transform.w, transform.h, transform.z);
+        }
+    
+        // (2) Batch creation
+        #[derive(Debug)]
+        struct Batch {
+            texture_ptr: usize,
+            drawables: Vec<(crate::ecs::Transform, std::rc::Rc<crate::renderer::TextureHandle>)>,
+        }
+        let mut batches: Vec<Batch> = Vec::new();
+        for drawable in drawables {
+            let key = std::rc::Rc::as_ptr(&drawable.1) as usize;
+            if let Some(last) = batches.last_mut() {
+                if last.texture_ptr == key {
+                    last.drawables.push(drawable);
+                    continue;
+                }
+            }
+            batches.push(Batch {
+                texture_ptr: key,
+                drawables: vec![drawable],
+            });
+        }
+        log::debug!(target: "rendering", "Created {} batches", batches.len());
+        // 各バッチの z 値範囲を出力
+        for (i, batch) in batches.iter().enumerate() {
+            let mut z_min = std::f32::MAX;
+            let mut z_max = std::f32::MIN;
+            for (transform, _) in &batch.drawables {
+                if transform.z < z_min { z_min = transform.z; }
+                if transform.z > z_max { z_max = transform.z; }
+            }
+            log::debug!(target: "rendering", "Batch {}: texture_ptr = {:p}, drawables_count = {}, z range = [{:.2}, {:.2}]",
+                i, batch.drawables[0].1, batch.drawables.len(), z_min, z_max);
+        }
+    
+        // (3) Aggregation: Build global vertex and index buffers from batches
+        let mut global_vertices: Vec<[f32; 4]> = Vec::new();
+        let mut global_indices: Vec<u16> = Vec::new();
+    
+        struct BatchDrawCall {
+            texture_bg: wgpu::BindGroup,
+            vertex_offset: u64,
+            vertex_count: u32,
+            index_offset: u64,
+            index_count: u32,
+        }
+        let mut draw_calls = Vec::new();
+        let mut vertex_count_total: u16 = 0;
+    
+        for batch in batches {
+            let texture_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&batch.drawables[0].1.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&batch.drawables[0].1.sampler),
+                    },
+                ],
+                label: Some("Batched Texture BindGroup"),
+            });
+            let batch_vertex_offset_elements = global_vertices.len();
+            for (transform, _) in &batch.drawables {
+                // top-left, top-right, bottom-right, bottom-left
+                global_vertices.push([transform.x, transform.y + transform.h, 0.0, 0.0]);
+                global_vertices.push([transform.x + transform.w, transform.y + transform.h, 1.0, 0.0]);
+                global_vertices.push([transform.x + transform.w, transform.y, 1.0, 1.0]);
+                global_vertices.push([transform.x, transform.y, 0.0, 1.0]);
+    
+                global_indices.push(vertex_count_total);
+                global_indices.push(vertex_count_total + 1);
+                global_indices.push(vertex_count_total + 2);
+                global_indices.push(vertex_count_total + 2);
+                global_indices.push(vertex_count_total + 3);
+                global_indices.push(vertex_count_total);
+                vertex_count_total += 4;
+            }
+            let vertex_offset_bytes = (batch_vertex_offset_elements * std::mem::size_of::<[f32; 4]>()) as u64;
+            let batch_index_offset_elements = global_indices.len() - (batch.drawables.len() * 6);
+            let index_offset_bytes = (batch_index_offset_elements * std::mem::size_of::<u16>()) as u64;
+            let batch_vertex_count = (batch.drawables.len() * 4) as u32;
+            let batch_index_count = (batch.drawables.len() * 6) as u32;
+    
+            draw_calls.push(BatchDrawCall {
+                texture_bg,
+                vertex_offset: vertex_offset_bytes,
+                vertex_count: batch_vertex_count,
+                index_offset: index_offset_bytes,
+                index_count: batch_index_count,
+            });
+        }
+    
+        log::debug!(target: "rendering", "Aggregated vertices count: {}, indices count: {}", global_vertices.len(), global_indices.len());
+        log::debug!(target: "rendering", "Aggregated vertices (first 8): {:?}", &global_vertices.iter().take(8).collect::<Vec<_>>());
+        if global_vertices.len() > 8 {
+            log::debug!(target: "rendering", "Aggregated vertices (last 4): {:?}", &global_vertices[global_vertices.len()-4..]);
+        }
+        log::debug!(target: "rendering", "Aggregated indices: {:?}", global_indices);
+    
+        // (4) Buffer write and current_buffer check
+        log::debug!(target: "rendering", "Before buffer write, current_buffer = {}", self.current_buffer);
+        self.queue.write_buffer(&self.batched_vertex_buffers[self.current_buffer], 0, bytemuck::cast_slice(&global_vertices));
+        self.queue.write_buffer(&self.batched_index_buffers[self.current_buffer], 0, bytemuck::cast_slice(&global_indices));
+    
+        // (5) Render pass and draw calls
+        // ※必要なら、Renderer 側で保持している uniform の scale 値もここでログ出力してください。
+        let t_render = Instant::now();
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Batched Sprite Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            pass.set_pipeline(&self.texture_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            for (i, dc) in draw_calls.iter().enumerate() {
+                let vertex_range = dc.vertex_offset..(dc.vertex_offset + dc.vertex_count as u64 * std::mem::size_of::<[f32; 4]>() as u64);
+                let index_range = dc.index_offset..(dc.index_offset + dc.index_count as u64 * std::mem::size_of::<u16>() as u64);
+                log::debug!(target: "rendering", "Batch draw {}: vertex_range = {:?}, index_range = {:?}, texture BG = {:?}", 
+                    i, vertex_range, index_range, dc.texture_bg);
+                pass.set_bind_group(1, &dc.texture_bg, &[]);
+                pass.set_vertex_buffer(0, self.batched_vertex_buffers[self.current_buffer].slice(vertex_range));
+                pass.set_index_buffer(self.batched_index_buffers[self.current_buffer].slice(index_range), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..dc.index_count, 0, 0..1);
+                log::debug!(target: "rendering", "Draw call for batch {} executed, index_count = {}", i, dc.index_count);
+            }
+        }
+        log::debug!(target: "rendering", "Render pass complete in {:?}", t_render.elapsed());
+        log::debug!(target: "rendering", "Total batched draw time: {:?}", t0.elapsed());
+        log::debug!(target: "rendering", "=== End of draw_sprites_batched ===");
+    }
+    
+    
+    
+    
+    
+    
+        
 
 }
